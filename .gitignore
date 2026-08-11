@@ -1,0 +1,23 @@
+# Build trees
+build/
+build-*/
+cmake-build-*/
+
+# Vendored dependencies - restored by scripts/bootstrap.ps1 at pinned commits
+external/
+
+# Model weights (hundreds of MB)
+models/
+*.gguf
+
+# Recorded traces
+traces/
+*.trace
+*.llmscope
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
