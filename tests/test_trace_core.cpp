@@ -449,18 +449,34 @@ void test_fake_source_produces_a_coherent_model() {
 }  // namespace
 
 int main() {
-    test_record_layout();
-    test_ring_basic();
-    test_ring_overflow_drops_and_stays_consistent();
-    test_ring_threaded();
-    test_parse_node_name();
-    test_topology_tree();
-    test_topology_collect_ids();
-    test_payload_slot();
-    test_trace_file_roundtrip();
-    test_trace_file_rejects_garbage();
-    test_live_source_flow();
-    test_fake_source_produces_a_coherent_model();
+    // Unbuffered, and each test announced before it runs. A test that *crashes*
+    // rather than fails loses everything still sitting in stdout's buffer, so
+    // the log shows nothing at all about where it died - which is exactly what
+    // a mingw segfault in CI looked like.
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
+
+    const struct {
+        const char* name;
+        void (*fn)();
+    } tests[] = {
+        {"record_layout", test_record_layout},
+        {"ring_basic", test_ring_basic},
+        {"ring_overflow_drops_and_stays_consistent", test_ring_overflow_drops_and_stays_consistent},
+        {"ring_threaded", test_ring_threaded},
+        {"parse_node_name", test_parse_node_name},
+        {"topology_tree", test_topology_tree},
+        {"topology_collect_ids", test_topology_collect_ids},
+        {"payload_slot", test_payload_slot},
+        {"trace_file_roundtrip", test_trace_file_roundtrip},
+        {"trace_file_rejects_garbage", test_trace_file_rejects_garbage},
+        {"live_source_flow", test_live_source_flow},
+        {"fake_source_produces_a_coherent_model", test_fake_source_produces_a_coherent_model},
+    };
+
+    for (const auto& t : tests) {
+        std::printf("-- %s\n", t.name);
+        t.fn();
+    }
 
     std::printf("\n%d checks, %d failures\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;
