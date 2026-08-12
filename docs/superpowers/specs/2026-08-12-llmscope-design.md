@@ -152,6 +152,21 @@ ledger that cries wolf is worse than no ledger.
   non-interactively and in CI.
 - **End-to-end**: 8478 nodes across 13 tokens captured from Qwen2.5-0.5B with zero drops; recorded to a 0.75 MB
   trace and replayed with the tree, names, attention, and anomalies all reconstructed.
+- **CI**, added after the fact: `ci.yml` builds without the llama.cpp backend on Linux (GCC, Clang) and Windows
+  (MinGW) for every push. Because that configuration never compiles `src/tracer/`, a second workflow
+  `tracer.yml` builds *with* the backend and traces a real GGUF, on tracer changes and weekly. Splitting them is
+  what keeps per-push CI fast without leaving the hook uncovered.
+
+Two defects surfaced the moment CI ran on hardware other than the development machine, both worth recording:
+
+1. The trace-file test polled records immediately after `load()`, but replay is paced from that moment and the
+   records span 9 us. It passed only where `load()` itself took longer than 9 us — true on Windows, false on
+   faster Linux runners. The test also indexed `recs[9]` without checking the size first, so a short read was
+   undefined behaviour rather than a clean failure.
+2. The Windows job segfaulted inside `libstdc++` on correct code. The binary is compiled by `C:\mingw64`, but
+   the job runs under Git Bash, which puts Git for Windows' own MinGW on `PATH`; `libstdc++-6.dll` resolved to a
+   different GCC build at run time. Linking `-static` removes the ambiguity. Not a defect in `trace_core` — but
+   a real hazard for anyone building this with a mixed MinGW environment.
 
 ## 10. Deliberately out of scope
 

@@ -1,5 +1,8 @@
 # llmscope
 
+[![ci](https://github.com/francium619/llmscope/actions/workflows/ci.yml/badge.svg)](https://github.com/francium619/llmscope/actions/workflows/ci.yml)
+[![tracer](https://github.com/francium619/llmscope/actions/workflows/tracer.yml/badge.svg)](https://github.com/francium619/llmscope/actions/workflows/tracer.yml)
+
 Live instrumentation, tracing, and replay for local transformer inference — in the terminal.
 
 llmscope attaches to a running [llama.cpp](https://github.com/ggml-org/llama.cpp) model **without modifying a
@@ -190,11 +193,21 @@ trace-file round-tripping including rejection of corrupt files.
 The UI is verified with `--snapshot`, which renders one frame off-screen to stdout and needs no TTY — usable in
 CI, and how the screenshot above was produced.
 
-CI (`.github/workflows/ci.yml`) builds with `-DLLMSCOPE_WITH_LLAMA=OFF` on Linux (GCC and Clang) and Windows
-(MinGW GCC), then runs the unit tests, renders a frame, records a synthetic trace and replays it, and checks
-that a corrupt file is rejected. Dropping the llama.cpp backend keeps CI free of a large dependency and a GGUF
-download; the dependency rule is what makes that possible, and the Linux jobs are what actually test the
-"portable C++17" claim, since Windows is the platform development already happens on.
+Two workflows, split by what they cost:
+
+| Workflow | Runs | Covers |
+|---|---|---|
+| `ci.yml` | every push | `-DLLMSCOPE_WITH_LLAMA=OFF` on Linux (GCC, Clang) and Windows (MinGW): unit tests, a rendered frame, a synthetic record/replay round-trip, corrupt-file rejection |
+| `tracer.yml` | tracer changes, weekly, on demand | `-DLLMSCOPE_WITH_LLAMA=ON`: builds llama.cpp, traces a real GGUF through `cb_eval`, and round-trips the result |
+
+Dropping the llama.cpp backend is what keeps per-push CI free of a large dependency and a 675 MB download — the
+dependency rule is what makes that possible. But it also means `src/tracer/` is never compiled there, so the
+hook would rot unnoticed; `tracer.yml` exists to cover exactly that, without slowing down every push. Both read
+their pinned dependency commits out of `scripts/bootstrap.ps1`, so CI and the documented local setup cannot
+drift apart.
+
+The Linux jobs are what actually test the "portable C++17" claim, since Windows is the platform development
+already happens on.
 
 ---
 

@@ -1,0 +1,149 @@
+name: tracer
+
+# The `ci` workflow builds with -DLLMSCOPE_WITH_LLAMA=OFF, which means it never
+# compiles src/tracer at all - the cb_eval hook, the stats kernels, the one part
+# of the project that actually touches a model. That keeps per-push CI fast and
+# free of a large dependency, but it leaves the most important module with no
+# automated coverage whatsoever.
+#
+# This workflow closes that gap: it builds llama.cpp for real, traces an actual
+# GGUF, and checks the result round-trips. It is slow (a llama.cpp build plus a
+# 675 MB model), so it does not run on every push - only when the tracer itself
+# changes, weekly, or on demand.
+#
+# Both the dependency commits and the model URL are read out of
+# scripts/bootstrap.ps1, so this workflow and the documented local setup cannot
+# drift apart.
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 5 * * 1'  # Mondays, 05:00 UTC
+  push:
+    paths:
+      - 'src/tracer/**'
+      - 'CMakeLists.txt'
+      - '.github/workflows/tracer.yml'
+
+jobs:
+  trace-a-real-model:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Resolve pinned dependencies
+        id: pin
+        shell: bash
+        run: |
+          b=scripts/bootstrap.ps1
+          ftxui_repo=$(sed -n 's/^\$FTXUI_REPO *= *.\(https[^'"'"']*\).*/\1/p' $b)
+          ftxui_commit=$(sed -n 's/^\$FTXUI_COMMIT *= *.\([0-9a-f]\{40\}\).*/\1/p' $b)
+          llama_repo=$(sed -n 's/^\$LLAMA_REPO *= *.\(https[^'"'"']*\).*/\1/p' $b)
+          llama_commit=$(sed -n 's/^\$LLAMA_COMMIT *= *.\([0-9a-f]\{40\}\).*/\1/p' $b)
+          model_url=$(sed -n "s/.*\(https:\/\/huggingface\.co[^']*\).*/\1/p" $b | head -1)
+          for v in ftxui_repo ftxui_commit llama_repo llama_commit model_url; do
+            if [ -z "${!v}" ]; then echo "could not read $v from $b" >&2; exit 1; fi
+            echo "$v=${!v}" >> "$GITHUB_OUTPUT"
+          done
+          echo "llama    $llama_commit"
+          echo "ftxui    $ftxui_commit"
+          echo "model    $model_url"
+
+      - name: Cache dependencies
+        id: cache-deps
+        uses: actions/cache@v6
+        with:
+          path: external
+          key: deps-${{ steps.pin.outputs.llama_commit }}-${{ steps.pin.outputs.ftxui_commit }}
+
+      - name: Fetch dependencies
+        if: steps.cache-deps.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          fetch() {  # url, commit, dest - mirrors Get-PinnedRepo in bootstrap.ps1
+            mkdir -p "$3"
+            git -C "$3" init -q
+            git -C "$3" remote add origin "$1"
+            git -C "$3" fetch -q --depth 1 origin "$2"
+            git -C "$3" checkout -q FETCH_HEAD
+          }
+          fetch "${{ steps.pin.outputs.llama_repo }}" "${{ steps.pin.outputs.llama_commit }}" external/llama.cpp
+          fetch "${{ steps.pin.outputs.ftxui_repo }}" "${{ steps.pin.outputs.ftxui_commit }}" external/FTXUI
+
+      # 675 MB, and the URL is pinned to a specific quantisation, so the cache
+      # key never needs to change unless bootstrap.ps1 points somewhere else.
+      - name: Cache model
+        id: cache-model
+        uses: actions/cache@v6
+        with:
+          path: models
+          key: model-${{ hashFiles('scripts/bootstrap.ps1') }}
+
+      - name: Download model
+        if: steps.cache-model.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          mkdir -p models
+          curl -fSL --retry 3 -o models/qwen2.5-0.5b-instruct-q8_0.gguf \
+            "${{ steps.pin.outputs.model_url }}"
+          ls -lh models/
+
+      - name: Install Ninja
+        run: sudo apt-get update && sudo apt-get install -y ninja-build
+
+      - name: Build with the llama.cpp backend
+        shell: bash
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLLMSCOPE_WITH_LLAMA=ON \
+            -DLLMSCOPE_BUILD_TESTS=ON
+          cmake --build build
+
+      - name: Unit tests
+        shell: bash
+        run: ctest --test-dir build --output-on-failure
+
+      # The actual point of this workflow: drive a real forward pass through the
+      # cb_eval hook and confirm nodes come out the other side.
+      - name: Trace a real model
+        shell: bash
+        run: |
+          ./build/bin/llmscope \
+            --model models/qwen2.5-0.5b-instruct-q8_0.gguf \
+            -p "The capital of France is" -n 6 \
+            --headless --record real.trace | tee trace.txt
+
+          nodes=$(sed -n 's/.*captured \([0-9]*\) nodes.*/\1/p' trace.txt)
+          dropped=$(sed -n 's/.*(\([0-9]*\) dropped).*/\1/p' trace.txt)
+          echo "nodes=$nodes dropped=$dropped"
+
+          [ -n "$nodes" ] && [ "$nodes" -gt 1000 ] || { echo "expected >1000 nodes, got '$nodes'"; exit 1; }
+          [ "$dropped" = "0" ] || { echo "ring dropped $dropped records"; exit 1; }
+
+      - name: Replay what was recorded
+        shell: bash
+        run: |
+          ./build/bin/llmscope --replay real.trace --headless | tee replay.txt
+          a=$(sed -n 's/.*captured \([0-9]*\) nodes.*/\1/p' trace.txt)
+          b=$(sed -n 's/.*captured \([0-9]*\) nodes.*/\1/p' replay.txt)
+          echo "recorded $a, replayed $b"
+          [ "$a" = "$b" ] || { echo "round-trip lost records"; exit 1; }
+
+      - name: Render a frame from the real trace
+        shell: bash
+        run: |
+          out=$(./build/bin/llmscope --replay real.trace --snapshot)
+          echo "$out" | head -20
+          echo "$out" | grep -q "MODEL TOPOLOGY" || { echo "topology pane missing"; exit 1; }
+
+      - name: Upload the trace
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: real-trace
+          path: real.trace
+          if-no-files-found: warn
+          retention-days: 7
