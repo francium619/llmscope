@@ -296,8 +296,10 @@ void test_trace_file_roundtrip() {
 
         std::vector<Topology::Entry> names;
         CHECK(src->poll_names(names) == 2);
-        CHECK(names[0].name == "attn_norm-0");
-        CHECK(names[1].layer == 0);
+        if (names.size() == 2) {  // guard: a short read must not index past the end
+            CHECK(names[0].name == "attn_norm-0");
+            CHECK(names[1].layer == 0);
+        }
 
         // Replay is time-paced from the moment of load, and the records span the
         // trace's own 9 us, so wait past that before expecting the full set -
@@ -317,7 +319,9 @@ void test_trace_file_roundtrip() {
         std::vector<AnomalyRecord> anomalies;
         src->poll_anomalies(anomalies, 100);
         CHECK(anomalies.size() == 1);
-        CHECK(anomalies[0].kind == static_cast<uint8_t>(AnomalyKind::OutlierMagnitude));
+        if (!anomalies.empty()) {
+            CHECK(anomalies[0].kind == static_cast<uint8_t>(AnomalyKind::OutlierMagnitude));
+        }
 
         // restart() rewinds the cursor, but replay is time-paced: immediately
         // after a rewind almost nothing is due yet. Wait past the trace's own
