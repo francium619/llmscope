@@ -28,14 +28,24 @@ jobs:
             os: ubuntu-latest
             cc: gcc
             cxx: g++
+            cmake_extra: ''
           - name: linux-clang
             os: ubuntu-latest
             cc: clang
             cxx: clang++
+            cmake_extra: ''
+          # Statically link the GCC runtime. Git Bash puts Git for Windows'
+          # own MinGW on PATH, so a dynamically linked binary compiled by
+          # C:\mingw64 resolves libstdc++-6.dll from C:\Program Files\Git at
+          # run time instead. The two are different GCC builds, and the ABI
+          # mismatch segfaults inside std::string/ifstream code that is
+          # perfectly correct - it crashed in the trace-file test with a stack
+          # three frames deep in the wrong libstdc++.
           - name: windows-mingw
             os: windows-latest
             cc: gcc
             cxx: g++
+            cmake_extra: '-DCMAKE_EXE_LINKER_FLAGS=-static'
 
     steps:
       - uses: actions/checkout@v4
@@ -96,7 +106,8 @@ jobs:
           cmake -S . -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DLLMSCOPE_WITH_LLAMA=OFF \
-            -DLLMSCOPE_BUILD_TESTS=ON
+            -DLLMSCOPE_BUILD_TESTS=ON \
+            ${{ matrix.cmake_extra }}
 
       - name: Build
         shell: bash
