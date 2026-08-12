@@ -106,6 +106,21 @@ jobs:
         shell: bash
         run: ctest --test-dir build --output-on-failure
 
+      # A crash in a test tells you almost nothing from ctest alone. Only runs
+      # when something already failed, and never changes the job's verdict.
+      - name: Backtrace on failure
+        if: failure()
+        shell: bash
+        run: |
+          echo "toolchain:"; ${CXX:-g++} --version | head -1
+          if command -v gdb >/dev/null; then
+            gdb --batch -ex run -ex "bt full" -ex "info threads" \
+                --args ./build/bin/llmscope_tests || true
+          else
+            echo "gdb not available on this runner"
+            ./build/bin/llmscope_tests || echo "exit=$?"
+          fi
+
       # The TUI is verified by rendering one frame off-screen: no TTY required,
       # which is the whole reason --snapshot exists.
       - name: Render a frame (--demo --snapshot)
