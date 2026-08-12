@@ -299,14 +299,20 @@ void test_trace_file_roundtrip() {
         CHECK(names[0].name == "attn_norm-0");
         CHECK(names[1].layer == 0);
 
-        // Everything is timestamped in the past, so one poll should release all
-        // ten records.
+        // Replay is time-paced from the moment of load, and the records span the
+        // trace's own 9 us, so wait past that before expecting the full set -
+        // exactly as the restart() case below does. Polling immediately only
+        // works where load() happens to take longer than 9 us, which is why this
+        // passed on Windows and failed on faster Linux CI runners.
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
         std::vector<NodeRecord> recs;
         src->poll_records(recs, 100);
         CHECK(recs.size() == 10);
-        CHECK(recs[0].seq == 0);
-        CHECK(recs[9].dur_ns == 500);
-        CHECK(recs[4].sparsity == 0.25f);
+        if (recs.size() == 10) {  // guard: a short read must not index past the end
+            CHECK(recs[0].seq == 0);
+            CHECK(recs[9].dur_ns == 500);
+            CHECK(recs[4].sparsity == 0.25f);
+        }
 
         std::vector<AnomalyRecord> anomalies;
         src->poll_anomalies(anomalies, 100);
@@ -321,7 +327,9 @@ void test_trace_file_roundtrip() {
         std::vector<NodeRecord> again;
         src->poll_records(again, 100);
         CHECK(again.size() == 10);
-        CHECK(again[0].seq == 0);
+        if (!again.empty()) {
+            CHECK(again[0].seq == 0);
+        }
     }
 
     std::remove(path.c_str());
