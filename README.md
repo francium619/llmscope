@@ -190,6 +190,12 @@ trace-file round-tripping including rejection of corrupt files.
 The UI is verified with `--snapshot`, which renders one frame off-screen to stdout and needs no TTY — usable in
 CI, and how the screenshot above was produced.
 
+CI (`.github/workflows/ci.yml`) builds with `-DLLMSCOPE_WITH_LLAMA=OFF` on Linux (GCC and Clang) and Windows
+(MinGW GCC), then runs the unit tests, renders a frame, records a synthetic trace and replays it, and checks
+that a corrupt file is rejected. Dropping the llama.cpp backend keeps CI free of a large dependency and a GGUF
+download; the dependency rule is what makes that possible, and the Linux jobs are what actually test the
+"portable C++17" claim, since Windows is the platform development already happens on.
+
 ---
 
 ## CLI
@@ -213,7 +219,8 @@ TRACING
       --capture-layer <n>   block whose attention scores to snapshot (default 0)
       --anomaly-max <f>     |activation| ceiling for the ledger (default 10000)
       --no-anomalies        disable anomaly detection
-      --headless            no TUI; trace to file and print a summary
+      --headless            no TUI; drain the source, trace to file, print a summary
+                            (works with --model, --demo and --replay)
 
 DISPLAY
       --ascii               ASCII-only glyphs

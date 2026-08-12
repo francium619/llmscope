@@ -1,0 +1,135 @@
+name: ci
+
+# The tracer needs llama.cpp; everything else does not. CI therefore builds with
+# -DLLMSCOPE_WITH_LLAMA=OFF, which covers trace_core, the TUI, the tests and the
+# CLI without compiling a large dependency or downloading a GGUF. That is the
+# same configuration the project's dependency rule was designed to make possible:
+# tui/ never includes a llama.cpp header, so it builds and runs without one.
+#
+# Linux jobs are the point of this workflow. The project is developed on Windows,
+# so Windows is the platform that is already known to work; the ubuntu jobs are
+# what actually test the "portable C++17" claim in the README.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-gcc
+            os: ubuntu-latest
+            cc: gcc
+            cxx: g++
+          - name: linux-clang
+            os: ubuntu-latest
+            cc: clang
+            cxx: clang++
+          - name: windows-mingw
+            os: windows-latest
+            cc: gcc
+            cxx: g++
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # external/ is gitignored and restored by scripts/bootstrap.ps1, which
+      # pins every dependency to an exact commit. Read the pin straight out of
+      # that script rather than repeating it here, so the two cannot drift.
+      - name: Resolve pinned FTXUI commit
+        id: pin
+        shell: bash
+        run: |
+          repo=$(sed -n 's/^\$FTXUI_REPO *= *.\(https[^'"'"']*\).*/\1/p' scripts/bootstrap.ps1)
+          commit=$(sed -n 's/^\$FTXUI_COMMIT *= *.\([0-9a-f]\{40\}\).*/\1/p' scripts/bootstrap.ps1)
+          if [ -z "$repo" ] || [ -z "$commit" ]; then
+            echo "could not read the FTXUI pin out of scripts/bootstrap.ps1" >&2
+            exit 1
+          fi
+          echo "repo=$repo" >> "$GITHUB_OUTPUT"
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+          echo "FTXUI $commit"
+
+      - name: Cache FTXUI
+        id: cache-ftxui
+        uses: actions/cache@v4
+        with:
+          path: external/FTXUI
+          key: ftxui-${{ steps.pin.outputs.commit }}
+
+      # Fetch only the pinned commit, mirroring Get-PinnedRepo in bootstrap.ps1.
+      - name: Fetch FTXUI
+        if: steps.cache-ftxui.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          mkdir -p external/FTXUI
+          git -C external/FTXUI init -q
+          git -C external/FTXUI remote add origin "${{ steps.pin.outputs.repo }}"
+          git -C external/FTXUI fetch -q --depth 1 origin "${{ steps.pin.outputs.commit }}"
+          git -C external/FTXUI checkout -q FETCH_HEAD
+
+      - name: Install Ninja (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y ninja-build
+
+      # windows-latest ships mingw-w64 and Ninja. GCC is deliberate rather than
+      # incidental: it is the compiler the project is actually built with
+      # locally (w64devkit), so this job exercises the documented toolchain.
+      - name: Add MinGW to PATH (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: echo "C:/mingw64/bin" >> "$GITHUB_PATH"
+
+      - name: Configure
+        shell: bash
+        env:
+          CC: ${{ matrix.cc }}
+          CXX: ${{ matrix.cxx }}
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLLMSCOPE_WITH_LLAMA=OFF \
+            -DLLMSCOPE_BUILD_TESTS=ON
+
+      - name: Build
+        shell: bash
+        run: cmake --build build
+
+      - name: Unit tests
+        shell: bash
+        run: ctest --test-dir build --output-on-failure
+
+      # The TUI is verified by rendering one frame off-screen: no TTY required,
+      # which is the whole reason --snapshot exists.
+      - name: Render a frame (--demo --snapshot)
+        shell: bash
+        run: |
+          out=$(./build/bin/llmscope --demo --snapshot)
+          echo "$out" | head -20
+          echo "$out" | grep -q "MODEL TOPOLOGY" || { echo "topology pane missing"; exit 1; }
+          echo "$out" | grep -q "LIVE PACKET STREAM" || { echo "stream pane missing"; exit 1; }
+
+      # Record a synthetic run and replay it, so the on-disk trace format is
+      # covered end to end and not only by the round-trip unit tests.
+      - name: Record and replay a trace
+        shell: bash
+        run: |
+          ./build/bin/llmscope --demo --headless -n 8 --record ci.trace
+          ./build/bin/llmscope --replay ci.trace --headless | tee replay.txt
+          grep -q "across 8 tokens" replay.txt || { echo "replay lost tokens"; exit 1; }
+
+      - name: Reject a corrupt trace
+        shell: bash
+        run: |
+          printf 'not a trace file at all' > bad.trace
+          if ./build/bin/llmscope --replay bad.trace --headless; then
+            echo "a corrupt trace was accepted"; exit 1
+          fi
+          echo "corrupt trace rejected as expected"

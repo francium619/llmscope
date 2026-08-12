@@ -4,12 +4,14 @@
 //   --model  <gguf>   run llama.cpp under the tracer (optionally --record)
 //   --replay <trace>  play back a recorded trace
 //   --demo            synthetic model, no inference, no model file
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include "trace_core/fake_source.hpp"
 #include "trace_core/live_source.hpp"
@@ -46,7 +48,8 @@ void print_usage() {
         "      --capture-layer <n> block whose attention scores to snapshot (default 0)\n"
         "      --anomaly-max <f>  |activation| ceiling for the ledger (default 10000)\n"
         "      --no-anomalies     disable anomaly detection entirely\n"
-        "      --headless         no TUI; trace to file and print a summary\n"
+        "      --headless         no TUI; drain the source, trace to file, print a summary\n"
+        "                         (works with --model, --demo and --replay)\n"
         "\n"
         "DISPLAY\n"
         "      --ascii            ASCII-only glyphs for terminals without block chars\n"
@@ -71,6 +74,76 @@ bool next_arg(int argc, char** argv, int& i, const char* flag, std::string& out)
     return true;
 }
 
+// Drain a source to completion with no TUI, optionally recording it.
+//
+// The live path records from inside the tracer thread, so this exists for the
+// sources that have no thread of their own: --demo and --replay. Without it
+// those two fell through to the interactive TUI, which blocks forever when
+// there is no TTY to read keys from.
+int drain_headless(llmscope::TraceSource& src, const std::string& trace_out) {
+    llmscope::TraceWriter writer;
+    if (!trace_out.empty()) {
+        std::string werr;
+        if (!writer.open(trace_out, werr)) {
+            std::fprintf(stderr, "llmscope: %s\n", werr.c_str());
+            return 1;
+        }
+        writer.write_model(src.model_info());
+    }
+
+    std::vector<llmscope::Topology::Entry> names;
+    std::vector<llmscope::NodeRecord> records;
+    std::vector<llmscope::AnomalyRecord> anomalies;
+    std::vector<llmscope::TokenInfo> tokens;
+    llmscope::PayloadHeader header{};
+    std::vector<float> payload;
+    uint64_t last_payload_version = 0;
+
+    auto pump = [&] {
+        // Names first: a Name chunk must precede any Record that references it.
+        names.clear();
+        src.poll_names(names);
+        records.clear();
+        src.poll_records(records, 8192);
+        anomalies.clear();
+        src.poll_anomalies(anomalies, 1024);
+        tokens.clear();
+        src.poll_tokens(tokens);
+
+        if (!writer.is_open()) return;
+        for (const llmscope::Topology::Entry& e : names) {
+            writer.write_name(e.name_id, e.name, e.kind, e.layer);
+        }
+        for (const llmscope::NodeRecord& r : records) writer.write_record(r);
+        for (const llmscope::AnomalyRecord& a : anomalies) writer.write_anomaly(a);
+        for (const llmscope::TokenInfo& t : tokens) writer.write_token(t);
+
+        const uint64_t v = src.payload_version();
+        if (v != last_payload_version && src.read_payload(header, payload)) {
+            writer.write_payload(header, payload.data());
+            last_payload_version = v;
+        }
+    };
+
+    while (src.running()) {
+        pump();
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    pump();  // the source stops producing before its last records are collected
+
+    const llmscope::SourceStats s = src.stats();
+    std::printf("llmscope: captured %llu nodes across %llu tokens (%llu dropped)\n",
+                static_cast<unsigned long long>(s.records_total),
+                static_cast<unsigned long long>(s.tokens_done),
+                static_cast<unsigned long long>(s.records_dropped));
+    if (writer.is_open()) {
+        std::printf("llmscope: trace written to %s (%llu bytes)\n", writer.path().c_str(),
+                    static_cast<unsigned long long>(writer.bytes_written()));
+    }
+    writer.close();
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -82,6 +155,7 @@ int main(int argc, char** argv) {
     bool demo = false;
     bool headless = false;
     bool snapshot = false;
+    bool n_predict_set = false;
     int snap_w = 160;
     int snap_h = 48;
     int snap_warmup_ms = 1500;
@@ -104,6 +178,7 @@ int main(int argc, char** argv) {
         } else if (a == "-n" || a == "--n-predict") {
             if (!next_arg(argc, argv, i, "--n-predict", v)) return 2;
             cfg.n_predict = std::atoi(v.c_str());
+            n_predict_set = true;
         } else if (a == "-c" || a == "--ctx") {
             if (!next_arg(argc, argv, i, "--ctx", v)) return 2;
             cfg.n_ctx = std::atoi(v.c_str());
@@ -167,6 +242,13 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "llmscope: --model, --replay and --demo are mutually exclusive\n");
         return 2;
     }
+    // Only --model records from under the TUI; the other two sources are drained
+    // by --headless. Say so rather than accepting the flag and writing nothing.
+    if (!cfg.trace_out.empty() && !headless && (demo || !replay_path.empty())) {
+        std::fprintf(stderr,
+                     "llmscope: --record needs --headless with --demo/--replay; ignoring it\n");
+        cfg.trace_out.clear();
+    }
 
     // ---------------- replay ----------------
     if (!replay_path.empty()) {
@@ -175,6 +257,13 @@ int main(int argc, char** argv) {
         if (!src) {
             std::fprintf(stderr, "llmscope: %s\n", err.c_str());
             return 1;
+        }
+        if (headless) {
+            // Replay with no UI is a trace-validation pass: load it, walk every
+            // chunk, report what was in it. Nothing is pacing playback, so run
+            // the trace clock flat out rather than at recorded speed.
+            src->set_speed(1e6);
+            return drain_headless(*src, cfg.trace_out);
         }
         llmscope::TuiApp app(*src, ui);
         if (snapshot) {
@@ -186,7 +275,20 @@ int main(int argc, char** argv) {
 
     // ---------------- demo ----------------
     if (demo) {
-        llmscope::FakeSource src;
+        llmscope::FakeSource::Options fo;
+        if (n_predict_set) {
+            fo.max_tokens = static_cast<uint32_t>(cfg.n_predict > 0 ? cfg.n_predict : 1);
+        }
+        if (headless) {
+            // 6 tok/s exists to be watchable. With no UI there is nothing to
+            // watch, so step the synthetic clock as fast as it will go.
+            fo.tokens_per_sec = 2000.0;
+        }
+        llmscope::FakeSource src(fo);
+
+        if (headless) {
+            return drain_headless(src, cfg.trace_out);
+        }
         llmscope::TuiApp app(src, ui);
         if (snapshot) {
             std::fputs(app.snapshot(snap_w, snap_h, snap_warmup_ms).c_str(), stdout);
