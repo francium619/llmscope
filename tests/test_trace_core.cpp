@@ -13,6 +13,7 @@
 #include <thread>
 #include <vector>
 
+#include "trace_core/anomaly_detector.hpp"
 #include "trace_core/fake_source.hpp"
 #include "trace_core/live_source.hpp"
 #include "trace_core/payload_slot.hpp"
@@ -450,6 +451,137 @@ void test_fake_source_produces_a_coherent_model() {
     CHECK(normalised);
 }
 
+// ---------------------------------------------------------------------------
+// Anomaly rules
+// ---------------------------------------------------------------------------
+
+NodeRecord anomaly_rec(NodeKind kind, uint16_t name_id, uint32_t token, int64_t elements) {
+    NodeRecord r{};
+    r.kind = static_cast<uint8_t>(kind);
+    r.name_id = name_id;
+    r.token_index = token;
+    r.ne[0] = elements;
+    r.ne[1] = 1;
+    r.ne[2] = 1;
+    r.ne[3] = 1;
+    return r;
+}
+
+void test_anomaly_flags_a_dead_activation() {
+    AnomalyDetector det;
+    std::vector<AnomalyRecord> out;
+
+    NodeRecord r = anomaly_rec(NodeKind::Ffn, 7, 0, 4096);
+    r.sparsity = 0.999f;
+    det.evaluate(r, out);
+
+    CHECK(out.size() == 1);
+    CHECK(out[0].kind == static_cast<uint8_t>(AnomalyKind::HighSparsity));
+    CHECK(out[0].name_id == 7);
+}
+
+void test_anomaly_ignores_sparse_kv_cache() {
+    // A KV cache is allocated for the whole context and filled one position per
+    // token, so early in a run it is ~99.6% zeros *by construction*. Flagging it
+    // is not a finding, and on a real 24-layer model it drowned the ledger: 144
+    // of 147 anomalies on a healthy 9-token run were cache_k/cache_v views.
+    AnomalyDetector det;
+    std::vector<AnomalyRecord> out;
+
+    NodeRecord r = anomaly_rec(NodeKind::Cache, 11, 0, 4096);
+    r.sparsity = 0.999f;
+    det.evaluate(r, out);
+
+    CHECK(out.empty());
+}
+
+void test_anomaly_still_flags_nan_in_a_cache_node() {
+    // Excluding caches from the *sparsity* rule must not excuse them from the
+    // rules that are unambiguous faults.
+    AnomalyDetector det;
+    std::vector<AnomalyRecord> out;
+
+    NodeRecord r = anomaly_rec(NodeKind::Cache, 12, 0, 4096);
+    r.sparsity = 0.999f;
+    r.flags = kFlagHasNaN;
+    det.evaluate(r, out);
+
+    CHECK(out.size() == 1);
+    CHECK(out[0].kind == static_cast<uint8_t>(AnomalyKind::NaN));
+}
+
+void test_anomaly_reports_once_per_node_per_token() {
+    AnomalyDetector det;
+    std::vector<AnomalyRecord> out;
+
+    NodeRecord r = anomaly_rec(NodeKind::Ffn, 7, 0, 4096);
+    r.sparsity = 0.999f;
+    det.evaluate(r, out);
+    det.evaluate(r, out);
+    CHECK(out.size() == 1);  // same node, same rule, same token
+
+    r.token_index = 1;
+    det.evaluate(r, out);
+    CHECK(out.size() == 2);  // a new token reports again
+}
+
+void test_anomaly_magnitude_and_small_tensors() {
+    AnomalyDetector det;
+    std::vector<AnomalyRecord> out;
+
+    NodeRecord big = anomaly_rec(NodeKind::Attention, 3, 0, 4096);
+    big.absmax = 2e4f;
+    det.evaluate(big, out);
+    CHECK(out.size() == 1);
+    CHECK(out[0].kind == static_cast<uint8_t>(AnomalyKind::OutlierMagnitude));
+
+    // Tiny tensors are trivially sparse, so the sparsity rule ignores them.
+    out.clear();
+    NodeRecord tiny = anomaly_rec(NodeKind::Ffn, 4, 0, 8);
+    tiny.sparsity = 1.0f;
+    det.evaluate(tiny, out);
+    CHECK(out.empty());
+}
+
+void test_anomaly_latency_spike_compares_a_node_to_itself() {
+    AnomalyDetector det;
+    std::vector<AnomalyRecord> out;
+
+    NodeRecord r = anomaly_rec(NodeKind::Ffn, 9, 0, 4096);
+    r.dur_ns = 1'000'000;
+    det.evaluate(r, out);
+    CHECK(out.empty());  // the first sighting only seeds the average
+
+    r.token_index = 1;
+    r.dur_ns = 50'000'000;  // 50x the seeded average
+    det.evaluate(r, out);
+    CHECK(out.size() == 1);
+    CHECK(out[0].kind == static_cast<uint8_t>(AnomalyKind::LatencySpike));
+
+    // A node that is merely slow, not spiking, stays quiet.
+    out.clear();
+    NodeRecord slow = anomaly_rec(NodeKind::Ffn, 10, 0, 4096);
+    slow.dur_ns = 40'000'000;
+    det.evaluate(slow, out);
+    slow.token_index = 1;
+    det.evaluate(slow, out);
+    CHECK(out.empty());
+}
+
+void test_anomaly_disabled_reports_nothing() {
+    AnomalyConfig cfg;
+    cfg.enabled = false;
+    AnomalyDetector det(cfg);
+    std::vector<AnomalyRecord> out;
+
+    NodeRecord r = anomaly_rec(NodeKind::Ffn, 7, 0, 4096);
+    r.sparsity = 0.999f;
+    r.flags = kFlagHasNaN;
+    det.evaluate(r, out);
+
+    CHECK(out.empty());
+}
+
 }  // namespace
 
 int main() {
@@ -475,6 +607,14 @@ int main() {
         {"trace_file_rejects_garbage", test_trace_file_rejects_garbage},
         {"live_source_flow", test_live_source_flow},
         {"fake_source_produces_a_coherent_model", test_fake_source_produces_a_coherent_model},
+        {"anomaly_flags_a_dead_activation", test_anomaly_flags_a_dead_activation},
+        {"anomaly_ignores_sparse_kv_cache", test_anomaly_ignores_sparse_kv_cache},
+        {"anomaly_still_flags_nan_in_a_cache_node", test_anomaly_still_flags_nan_in_a_cache_node},
+        {"anomaly_reports_once_per_node_per_token", test_anomaly_reports_once_per_node_per_token},
+        {"anomaly_magnitude_and_small_tensors", test_anomaly_magnitude_and_small_tensors},
+        {"anomaly_latency_spike_compares_a_node_to_itself",
+         test_anomaly_latency_spike_compares_a_node_to_itself},
+        {"anomaly_disabled_reports_nothing", test_anomaly_disabled_reports_nothing},
     };
 
     for (const auto& t : tests) {
