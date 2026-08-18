@@ -25,6 +25,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "trace_core/anomaly_detector.hpp"
 #include "trace_core/live_source.hpp"
 #include "trace_core/record.hpp"
 #include "trace_core/trace_file.hpp"
@@ -91,25 +92,21 @@ private:
     // after warmup.
     std::vector<uint8_t> device_buf_;   // staging for non-host tensors
     std::vector<float> payload_buf_;
+    std::vector<AnomalyRecord> anomaly_buf_;  // findings for the current node
 
     uint64_t epoch_ns_ = 0;
     uint64_t node_start_ns_ = 0;
     uint64_t seq_ = 0;
     uint32_t token_index_ = 0;
 
-    // Per-node exponential moving average of duration, for latency-spike
-    // detection. An EMA rather than a true median: it is O(1) per node with no
-    // allocation, which a median over a window would not be.
-    std::unordered_map<uint16_t, float> latency_ema_;
-
     // Names already emitted to the trace file. Without this the file would
     // contain records referencing name ids that replay cannot resolve.
     std::unordered_set<uint16_t> written_names_;
 
-    // Last token index at which each (node, rule) pair fired. Repeating the same
-    // finding 300 times a second turns the ledger into noise, so each pair
-    // reports at most once per token.
-    std::unordered_map<uint32_t, uint32_t> anomaly_last_token_;
+    // The anomaly rules and their cross-token state (dedup + per-node latency
+    // baseline). Lives in trace_core so replay and FakeSource reach the same
+    // verdicts as a live run.
+    AnomalyDetector detector_;
 };
 
 }  // namespace llmscope

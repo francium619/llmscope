@@ -44,9 +44,11 @@ void silent_log(ggml_log_level, const char*, void*) {}
 
 }  // namespace
 
-Tracer::Tracer(LiveSource& sink, TracerConfig cfg) : sink_(sink), cfg_(std::move(cfg)) {
+Tracer::Tracer(LiveSource& sink, TracerConfig cfg)
+    : sink_(sink), cfg_(std::move(cfg)), detector_(cfg_.anomaly) {
     device_buf_.reserve(1u << 20);
     payload_buf_.resize(kMaxPayloadFloats);
+    anomaly_buf_.reserve(8);  // more than one rule tripping per node is rare
 }
 
 Tracer::~Tracer() {
@@ -293,67 +295,17 @@ bool Tracer::maybe_capture_payload(const ggml_tensor* t, const void* data, const
 }
 
 void Tracer::check_anomalies(const NodeRecord& rec) {
-    if (!cfg_.anomaly.enabled) {
-        return;
-    }
+    // The rules themselves live in AnomalyDetector; this is only the plumbing
+    // that fans a finding out to the live TUI and the trace file. The scratch
+    // vector is a member so the eval callback stays allocation-free after warmup.
+    anomaly_buf_.clear();
+    detector_.evaluate(rec, anomaly_buf_);
 
-    auto emit = [&](AnomalyKind kind, float value, float threshold, Severity sev) {
-        // One report per (node, rule) per token. A genuinely stuck node still
-        // shows up every token; a merely noisy one no longer floods the ledger.
-        const uint32_t key = (static_cast<uint32_t>(rec.name_id) << 8) |
-                             static_cast<uint32_t>(kind);
-        auto slot = anomaly_last_token_.find(key);
-        if (slot != anomaly_last_token_.end() && slot->second == rec.token_index) {
-            return;
-        }
-        anomaly_last_token_[key] = rec.token_index;
-
-        AnomalyRecord a{};
-        a.seq = rec.seq;
-        a.t_start_ns = rec.t_start_ns;
-        a.value = value;
-        a.threshold = threshold;
-        a.layer = rec.layer;
-        a.name_id = rec.name_id;
-        a.kind = static_cast<uint8_t>(kind);
-        a.severity = static_cast<uint8_t>(sev);
+    for (const AnomalyRecord& a : anomaly_buf_) {
         sink_.push_anomaly(a);
         if (writer_.is_open()) {
             writer_.write_anomaly(a);
         }
-    };
-
-    if (rec.flags & kFlagHasNaN) {
-        emit(AnomalyKind::NaN, 0.0f, 0.0f, Severity::Error);
-    }
-    if (rec.flags & kFlagHasInf) {
-        emit(AnomalyKind::Inf, 0.0f, 0.0f, Severity::Error);
-    }
-    if (rec.absmax > cfg_.anomaly.magnitude_ceiling) {
-        emit(AnomalyKind::OutlierMagnitude, rec.absmax, cfg_.anomaly.magnitude_ceiling,
-             Severity::Warn);
-    }
-    if (rec.sparsity > cfg_.anomaly.sparsity_ceiling &&
-        element_count(rec) >= cfg_.anomaly.sparsity_min_elements) {
-        emit(AnomalyKind::HighSparsity, rec.sparsity, cfg_.anomaly.sparsity_ceiling,
-             Severity::Info);
-    }
-
-    // Latency spike vs this node's own moving average. Comparing a node only
-    // against itself avoids flagging every matmul just for being slower than a
-    // layernorm.
-    auto it = latency_ema_.find(rec.name_id);
-    const float dur = static_cast<float>(rec.dur_ns);
-    if (it == latency_ema_.end()) {
-        latency_ema_.emplace(rec.name_id, dur);
-    } else {
-        const float ema = it->second;
-        if (rec.dur_ns > cfg_.anomaly.latency_min_ns && ema > 0.0f &&
-            dur > ema * cfg_.anomaly.latency_factor) {
-            emit(AnomalyKind::LatencySpike, dur / 1e6f,
-                 ema * cfg_.anomaly.latency_factor / 1e6f, Severity::Warn);
-        }
-        it->second = ema * 0.9f + dur * 0.1f;
     }
 }
 
